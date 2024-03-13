@@ -15,7 +15,13 @@ from skimage import transform
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import monai
+from monai.transforms import (
+    Compose,
+    Activations,
+    AsDiscrete
+)
 # from segment_anything import sam_model_registry
 from build_sam import sam_model_registry
 import torch.nn.functional as F
@@ -24,6 +30,7 @@ import random
 from datetime import datetime
 import shutil
 import glob
+from lr_scheduler import LinearWarmupWrapper
 
 # set seeds
 torch.manual_seed(2023)
@@ -160,6 +167,12 @@ def parse_args():
         default="data/npy/CT_Abd",
         help="path to training npy files; two subfolders: gts and imgs",
     )
+    parser.add_argument(
+        "-v",
+        "--val_npy_path",
+        type=str,
+        help="path to validation npy files; two subfolders: gts and imgs"
+    )
     parser.add_argument("-task_name", type=str, default="MedSAM-ViT-B")
     parser.add_argument("-model_type", type=str, default="vit_b")
     parser.add_argument(
@@ -292,13 +305,15 @@ def main(args):
     )  # 93729252
     seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="mean")
     # cross entropy loss
-    ce_loss = nn.BCEWithLogitsLoss(reduction="mean")
+    # ce_loss = nn.BCEWithLogitsLoss(reduction="mean")
+    ce_loss = monai.losses.FocalLoss(reduction="mean")
     # %% train
     num_epochs = args.num_epochs
     iter_num = 0
     losses = []
     best_loss = 1e10
     train_dataset = NpyDataset(args.tr_npy_path)
+    val_dataset = NpyDataset(args.val_npy_path)
 
     print("Number of training samples: ", len(train_dataset))
     train_dataloader = DataLoader(
@@ -306,6 +321,13 @@ def main(args):
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    print("Number of validation samples: ", len(val_dataset))
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
         pin_memory=True,
     )
 
@@ -320,7 +342,34 @@ def main(args):
     if args.use_amp:
         scaler = torch.cuda.amp.GradScaler()
 
+    start_step = start_epoch * len(train_dataloader)
+    max_steps = len(train_dataloader) * num_epochs
+    warmup_steps = 1000
+    last_cosine_step = start_step - warmup_steps if start_step > warmup_steps else 0
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        max_steps - warmup_steps, 
+        last_epoch=last_cosine_step - 1
+    )
+    scheduler = LinearWarmupWrapper(
+        optimizer, 
+        lr_scheduler, 
+        args.lr, 
+        warmup_steps=warmup_steps, 
+        last_step=start_step - 1
+    )
+
+    dice_metric = monai.metrics.DiceMetric(reduction="mean")
+    iou_metric = monai.metrics.MeanIoU(reduction="mean")
+    hd95_metric = monai.metrics.HausdorffDistanceMetric(percentile=95.0, reduction="mean")
+    confusion_matrix_metric = monai.metrics.ConfusionMatrixMetric( 
+        metric_name=["accuracy", "precision", "sensitivity", "specificity", "f1_score"],
+        reduction="mean"
+    )
+    post_pred = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
+
     for epoch in range(start_epoch, num_epochs):
+        medsam_model.train()
         epoch_loss = 0
         for step, (image, gt2D, boxes, _) in enumerate(tqdm(train_dataloader)):
             optimizer.zero_grad()
@@ -334,6 +383,7 @@ def main(args):
                         medsam_pred, gt2D.float()
                     )
                 scaler.scale(loss).backward()
+                scheduler.step()
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -341,19 +391,89 @@ def main(args):
                 medsam_pred = medsam_model(image, boxes_np)
                 loss = seg_loss(medsam_pred, gt2D) + ce_loss(medsam_pred, gt2D.float())
                 loss.backward()
+                scheduler.step()
                 optimizer.step()
                 optimizer.zero_grad()
 
             epoch_loss += loss.item()
             iter_num += 1
-
+        
         epoch_loss /= step
         losses.append(epoch_loss)
+        print(f'Time: {datetime.now().strftime("%Y%m%d-%H%M")}, Epoch: {epoch}, Loss: {epoch_loss}')
+
+        medsam_model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for step, (image, gt2D, boxes, _) in enumerate(tqdm(val_dataloader)):
+                boxes_np = boxes.detach().cpu().numpy()
+                image, gt2D = image.to(device), gt2D.to(device)
+                medsam_pred = medsam_model(image, boxes_np)
+                loss = seg_loss(medsam_pred, gt2D) + ce_loss(medsam_pred, gt2D.float())
+                val_loss += loss.item()
+
+                val_outputs = [post_pred(i) for i in monai.data.utils.decollate_batch(medsam_pred)]
+                val_labels = monai.data.utils.decollate_batch(gt2D)
+
+                dice_metric(y_pred=val_outputs, y=val_labels)
+                iou_metric(y_pred=val_outputs, y=val_labels)
+                hd95_metric(y_pred=val_outputs, y=val_labels)
+                confusion_matrix_metric(y_pred=val_outputs, y=val_labels)
+        val_loss /= step
+        print(f'Time: {datetime.now().strftime("%Y%m%d-%H%M")}, Epoch: {epoch}, Val loss: {val_loss}')
+
+        dice = dice_metric.aggregate().item()
+        iou = iou_metric.aggregate().item()
+        hd95 = hd95_metric.aggregate().item()
+        cm = confusion_matrix_metric.aggregate()
+
+        for param_group in optimizer.param_groups:
+            current_lr = param_group["lr"]
+
+        # Log a random sample of test images along with their ground truth and predictions
+        random.seed(2024)
+        sample = random.sample(range(len(val_dataset)), 5)
+
+        inputs = torch.stack([val_dataset[i][0] for i in sample])
+        labels = torch.stack([val_dataset[i][1] for i in sample])
+        boxes = torch.stack([val_dataset[i][2] for i in sample])
+        with torch.no_grad():
+            outputs = medsam_model(inputs.to(device=device), boxes.detach().cpu().numpy())
+
+        fig, axes = plt.subplots(5, 3, figsize=(9, 15))
+        for i in range(5):
+            axes[i, 0].imshow(inputs[i, 0, ...].squeeze(), cmap="gray")
+            axes[i, 1].imshow(labels[i, 0, ...].squeeze(), cmap="gray")
+            im = axes[i, 2].imshow(torch.sigmoid(outputs[i]).squeeze().detach().cpu(), cmap="gray")
+            
+            # Create an additional axis for the colorbar
+            cax = fig.add_axes([axes[i, 2].get_position().x1 + 0.01,
+                                axes[i, 2].get_position().y0,
+                                0.02,
+                                axes[i, 2].get_position().height])
+            fig.colorbar(im, cax=cax)
+
         if args.use_wandb:
-            run.log({"epoch_loss": epoch_loss})
-        print(
-            f'Time: {datetime.now().strftime("%Y%m%d-%H%M")}, Epoch: {epoch}, Loss: {epoch_loss}'
-        )
+            run.log({
+                "epoch_loss": epoch_loss, 
+                "val_loss": val_loss,
+                "dice": dice,
+                "iou": iou,
+                "95hd": hd95,
+                "accuracy": cm[0].item(),
+                "precision": cm[1].item(),
+                "sensitivity": cm[2].item(),
+                "specificity": cm[3].item(),
+                "f1_score": cm[4].item(),
+                "lr": current_lr,
+                "examples": wandb.Image(fig)}
+            )
+        
+        dice_metric.reset()
+        iou_metric.reset()
+        hd95_metric.reset()
+        confusion_matrix_metric.reset()
+
         ## save the latest model
         checkpoint = {
             "model": medsam_model.state_dict(),
@@ -362,8 +482,8 @@ def main(args):
         }
         torch.save(checkpoint, join(model_save_path, "medsam_model_latest.pth"))
         ## save the best model
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
+        if val_loss < best_loss:
+            best_loss = val_loss
             checkpoint = {
                 "model": medsam_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
